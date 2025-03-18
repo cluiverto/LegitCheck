@@ -1,1 +1,1 @@
-llama-index
+llama_index
