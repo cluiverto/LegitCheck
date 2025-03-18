@@ -1,3 +1,4 @@
 llama_index
 llama-index-embeddings-huggingface
+llama-index-vector-stores
 chromadb
