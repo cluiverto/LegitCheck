@@ -8,7 +8,7 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.llms.ollama import Ollama
 
 # Ustawienia strony
-st.title("Aplikacja z LlamaIndex")
+st.title("LegitCheck")
 
 db = chromadb.PersistentClient(path="./ustawy_BAAI")
 chroma_collection = db.get_or_create_collection("pomoc_ukrainie")
