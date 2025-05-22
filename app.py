@@ -11,26 +11,35 @@ from llama_index.llms.ollama import Ollama
 st.set_page_config(page_title="LegitCheck", page_icon="⚖️")
 st.title("LegitCheck")
 
-db = chromadb.PersistentClient(path="./ustawy_BAAI")
-chroma_collection = db.get_or_create_collection("pomoc_ukrainie")
-vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-# Utwórz pipeline do przetwarzania dokumentów
-pipeline = IngestionPipeline(
-    transformations=[
-        SentenceSplitter(),
-        embed_model,
-    ],
-    vector_store=vector_store
-)
+# Inicjalizacja bazy danych i modeli
+#@st.cache_resource
+def initialize_rag_system():
+    db = chromadb.PersistentClient(path="./ustawy_BAAI")
+    chroma_collection = db.get_or_create_collection("pomoc_ukrainie")
+    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+    embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-# Utwórz indeks
-index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
+    # Pipeline do przetwarzania dokumentów
+    pipeline = IngestionPipeline(
+        transformations=[
+            SentenceSplitter(),
+            embed_model,
+        ],
+        vector_store=vector_store
+    )
 
-# Utwórz silnik zapytań
-llm = Ollama(model="qwen2:7b")
-query_engine = index.as_query_engine(llm=llm)
+    #Indeks
+    index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
+
+    # Silnik zapytań
+    llm = Ollama(model="qwen2:7b")
+
+    #Query engine
+    query_engine = index.as_query_engine(llm=llm, response_mode="tree_summarize")
+    return query_engine
+
+query_engine = initialize_rag_system()
 
 # Store LLM generated responses
 if "messages" not in st.session_state.keys():
