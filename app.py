@@ -56,3 +56,18 @@ if st.session_state.messages[-1]["role"] != "assistant":
             
     message = {"role": "assistant", "content": response}
     st.session_state.messages.append(message)
+
+
+# Sidebar FAQ
+with st.sidebar:
+    st.header("FAQ")
+    example_questions = [
+        "Od kogo nie można pobierać odcisków palców?",
+        "Jakie są procedury legalizacji pobytu?",
+        "Kto może ubiegać się o pomoc humanitarną?",
+        "Jakie dokumenty są wymagane do rejestracji?",
+        "Kiedy można odmówić udzielenia pomocy?"
+    ]
+    
+    for question in example_questions:
+        st.write(question)
