@@ -36,10 +36,14 @@ query_engine = index.as_query_engine(llm=llm)
 if "messages" not in st.session_state.keys():
     st.session_state.messages = [{"role": "assistant", "content": "Zadaj mi pytanie..."}]
 
-# Display chat messages
+# Display chat messages & custom avatar
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
+    if message["role"] == "assistant":
+        with st.chat_message("assistant", avatar="⚖️"):  # zmieniamy ikonę robocika na sowę
+            st.write(message["content"])
+    else:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
 
 # User-provided prompt
 if input := st.chat_input():
@@ -49,12 +53,12 @@ if input := st.chat_input():
 
 # Generate a new response if last message is not from assistant
 if st.session_state.messages[-1]["role"] != "assistant":
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar="⚖️"):  # tu też zmieniamy ikonę
         with st.spinner("Czekaj, odpowiedź jest generowana.."):
             response = query_engine.query(input) 
             st.write(response.response)  # Tylko odpowiedź
             
-    message = {"role": "assistant", "content": response}
+    message = {"role": "assistant", "content": response.response}  # poprawka, żeby content był tekstem
     st.session_state.messages.append(message)
 
 
