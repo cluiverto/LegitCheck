@@ -39,6 +39,29 @@ def initialize_rag_system():
     query_engine = index.as_query_engine(llm=llm, response_mode="tree_summarize")
     return query_engine
 
+def format_response_with_sources(response):
+    """Formatuje odpowiedź z źródłami"""
+    response_text = str(response.response)
+    
+    # Dodaj sekcję źródeł jeśli dostępne
+    if hasattr(response, 'source_nodes') and response.source_nodes:
+        response_text += "\n\n---\n\n"
+        response_text += "📚 **PRZESZUKANE ŹRÓDŁA:**\n\n"
+        
+        for i, node in enumerate(response.source_nodes[:3], 1):  # Top 3 źródła
+            # Pobranie metadanych
+            file_name = node.metadata.get('file_name', 'Nieznany dokument')
+            page_number = node.metadata.get('page_label', 'N/A')
+            score = node.score if hasattr(node, 'score') else 'N/A'
+            
+            response_text += f"**Źródło {i}:** {file_name}\n"
+            if page_number != 'N/A':
+                response_text += f"- Strona: {page_number}\n"
+            response_text += f"- Podobieństwo: {score:.3f}\n" if score != 'N/A' else ""
+            response_text += f"- Fragment: *\"{node.text[:80]}...\"*\n\n"
+    
+    return response_text
+
 query_engine = initialize_rag_system()
 
 # Store LLM generated responses
@@ -65,10 +88,18 @@ if st.session_state.messages[-1]["role"] != "assistant":
     with st.chat_message("assistant", avatar="⚖️"):  # tu też zmieniamy ikonę
         with st.spinner("Czekaj, odpowiedź jest generowana.."):
             response = query_engine.query(input) 
-            st.write(response.response)  # Tylko odpowiedź
-            
-    message = {"role": "assistant", "content": response.response}  # poprawka, żeby content był tekstem
-    st.session_state.messages.append(message)
+                            # Sformatuj odpowiedź
+            formatted_response = format_response_with_sources(response)
+
+                
+                # Wyświetl odpowiedź
+            st.markdown(formatted_response)
+                
+                # Dodaj do historii
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": formatted_response
+            })
 
 
 # Sidebar FAQ
