@@ -1,17 +1,15 @@
-import json
+import streamlit as st
 import logging
-from typing import List, Optional
+from typing import List, Dict, Optional
 import requests
 from elasticsearch import Elasticsearch
-from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-import torch
+import os, time
 from dataclasses import dataclass
-import os
+from dotenv import load_dotenv
 
 
-# Konfiguracja logowania
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -22,63 +20,111 @@ class DocumentChunk:
     retrieval_score: float = 0.0
     rerank_score: Optional[float] = None
     chunk_id: Optional[str] = None
+    source: Optional[str] = None
 
 
 @dataclass
 class LegalRAGConfig:
-    """Konfiguracja systemu RAG z rerankingiem"""
-    elasticsearch_host: str = "http://elasticsearch-no-ssl:9200"
-    elasticsearch_index: str = "mwi4"
-    embedding_service_url: str = "http://localhost:5000"  # tutaj URL do kontenera embeddingów
-    ollama_host: str = "http://host.docker.internal:11434"
-    model_name: str = "SpeakLeash/bielik-4.5b-v3.0-instruct:Q8_0"
-    
-    # Konfiguracja retrieval i rerankingu
-    retrieval_top_k: int = 100         # Ile chunków pobrać retrieval modelem
-    rerank_top_k: int = 10             # Ile chunków po rerankingu do kontekstu
-    
-    # Pozostałe ustawienia
+    """Konfiguracja systemu RAG"""
+    elasticsearch_host: str
+    elasticsearch_index: str
+    embedding_service_url: str
+    reranking_service_url: str
+    ollama_host: str
+    model_name: str
+
+    retrieval_top_k: int = 50
+    rerank_top_k: int = 3
     max_context_length: int = 4000
     use_reranking: bool = True
+    embedding_timeout: int = 120
+    embedding_retries: int = 2
+
+
+class EmbeddingClient:
+    """Klient do serwisu embedingów"""
+
+    def __init__(self, service_url: str, timeout: int = 120, retries: int = 2):
+        self.service_url = service_url
+        self.timeout = timeout
+        self.retries = retries
+        self.embedding_cache: Dict[str, List[float]] = {}
+        logger.info(f"EmbeddingClient: {service_url}")
+
+    def get_embedding(self, text: str) -> List[float]:
+        """Pobiera embedding"""
+        text_hash = str(hash(text))  #hashlib.md5(text.encode()).hexdigest()
+        if text_hash in self.embedding_cache:
+            return self.embedding_cache[text_hash]
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.service_url}/embed",
+                    json={"text": text},
+                    timeout=self.timeout
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    embedding = result.get("embedding", [])
+                    if embedding:
+                        self.embedding_cache[text_hash] = embedding
+                        return embedding
+            except Exception as e:
+                logger.warning(f"Embedding attempt {attempt}/{self.retries} failed: {e}")
+                if attempt < self.retries:
+                    time.sleep(2 ** (attempt - 1))
+
+        return []
+
+
+class RerankingClient:
+    """Klient do serwisu rerankingu"""
+
+    def __init__(self, service_url: str, timeout: int = 300):
+        self.service_url = service_url
+        self.timeout = timeout
+        logger.info(f"RerankingClient: {service_url}")
+
+    def rerank(self, query: str, documents: List[str], top_k: int = 10) -> tuple:
+        """Reranking dokumentów"""
+        try:
+            response = requests.post(
+                f"{self.service_url}/rerank",
+                json={
+                    "query": query,
+                    "documents": documents,
+                    "top_k": top_k
+                },
+                timeout=self.timeout
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("scores", []), result.get("ranked_indices", [])
+        except Exception as e:
+            logger.error(f"Reranking error: {e}")
+
+        return [], []
 
 
 class ElasticsearchRetrievalClient:
-    """Klient do wyszukiwania semantycznego z wykorzystaniem embeddingów"""
-    
-    def __init__(self, host: str, index_name: str, embedding_service_url: str):
+    """Klient Elasticsearch"""
+
+    def __init__(self, host: str, index_name: str, embedding_client: EmbeddingClient):
         self.es = Elasticsearch([host])
         self.index_name = index_name
-        self.embedding_service_url = embedding_service_url
-        logger.info(f"Używam serwisu embeddingów pod: {embedding_service_url}")
-    
-    def _get_embedding(self, text: str) -> List[float]:
-        """Wywołuje serwis embeddingów via REST API"""
-        try:
-            response = requests.post(
-                f"{self.embedding_service_url}/v1/embeddings",
-                headers={"Content-Type": "application/json"},
-                json={"text": text},
-                timeout=30
-            )
-            response.raise_for_status()
-            embedding = response.json().get("embedding")
-            if embedding is None:
-                raise ValueError("Brak embeddingu w odpowiedzi serwisu")
-            return embedding
-        except Exception as e:
-            logger.error(f"Błąd wywołania serwisu embeddingów: {e}")
-            raise
-    
+        self.embedding_client = embedding_client
+
     def search_with_embeddings(self, query: str, top_k: int = 50) -> List[DocumentChunk]:
-        """
-        Wyszukiwanie semantyczne używając embeddingów
-        """
+        """Wyszukiwanie semantyczne"""
         try:
-            # Generuj embedding dla zapytania przez serwis REST
-            logger.info(f"Generowanie embeddingu dla zapytania przez serwis embeddingów...")
-            query_embedding = self._get_embedding(query)
-            
-            # Wyszukiwanie kNN w Elasticsearch
+            query_embedding = self.embedding_client.get_embedding(query)
+
+            if not query_embedding:
+                return self._search_bm25(query, top_k)
+
             search_body = {
                 "size": top_k,
                 "query": {
@@ -90,162 +136,98 @@ class ElasticsearchRetrievalClient:
                         }
                     }
                 },
-                "_source": ["text"]
+                "_source": ["text", "title", "article", "paragraph", "id"]
             }
-            
+
             response = self.es.search(index=self.index_name, body=search_body)
-            
+
             chunks = []
             for hit in response['hits']['hits']:
+                source_data = hit['_source']
+
+                source_parts = []
+                if 'article' in source_data and source_data['article']:
+                    source_parts.append(f"art. {source_data['article']}")
+                if 'paragraph' in source_data and source_data['paragraph']:
+                    source_parts.append(f"§ {source_data['paragraph']}")
+                if 'id' in source_data and source_data['id']:
+                    source_parts.append(f"{source_data['id']}")
+
+                source = " - ".join(source_parts) if source_parts else "Nieznane źródło"
+
                 chunk = DocumentChunk(
-                    content=hit['_source'].get('text', ''),
+                    content=source_data.get('text', ''),
                     retrieval_score=hit['_score'],
-                    chunk_id=hit['_id']
+                    chunk_id=hit['_id'],
+                    source=source
                 )
                 chunks.append(chunk)
-            
-            logger.info(f"✅ Retrieval zwrócił {len(chunks)} chunków (top-{top_k})")
+
             return chunks
-            
+
         except Exception as e:
-            logger.error(f"Błąd podczas wyszukiwania: {e}")
+            logger.error(f"Search error: {e}")
+            return self._search_bm25(query, top_k)
+
+    def _search_bm25(self, query: str, top_k: int = 50) -> List[DocumentChunk]:
+        """Fallback BM25"""
+        try:
+            search_body = {
+                "size": top_k,
+                "query": {
+                    "multi_match": {
+                        "query": query,
+                        "fields": ["text"],
+                        "fuzziness": "AUTO"
+                    }
+                },
+                "_source": ["text", "title", "article", "paragraph"]
+            }
+
+            response = self.es.search(index=self.index_name, body=search_body)
+
+            chunks = []
+            for hit in response['hits']['hits']:
+                source_data = hit['_source']
+                source_parts = []
+                if 'title' in source_data:
+                    source_parts.append(source_data['title'])
+
+                chunk = DocumentChunk(
+                    content=source_data.get('text', ''),
+                    retrieval_score=hit['_score'],
+                    chunk_id=hit['_id'],
+                    source=" - ".join(source_parts) if source_parts else "BM25"
+                )
+                chunks.append(chunk)
+
+            return chunks
+        except Exception as e:
+            logger.error(f"BM25 error: {e}")
             return []
 
 
-class PolishReranker:
-    """Reranker dla języka polskiego używający sdadas/polish-reranker-roberta-v3"""
-    
-    def __init__(self):
-        logger.info("Ładowanie modelu rerankingowego: sdadas/polish-reranker-roberta-v3...")
-        
-        self.model_name = 'sdadas/polish-reranker-roberta-v3'
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-        
-        # Ustaw na tryb ewaluacji
-        self.model.eval()
-        
-        # Sprawdź czy GPU jest dostępne
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(self.device)
-        
-        logger.info(f"✅ Model rerankingowy załadowany na: {self.device}")
-    
-    def rerank_chunks(self, query: str, chunks: List[DocumentChunk], top_k: int = 6) -> List[DocumentChunk]:
-        """
-        Reranking chunków używając polish-reranker-roberta-v3
-        """
-        if not chunks:
-            return chunks
-        
-        logger.info(f"🎯 RERANKING: {len(chunks)} chunków → wybór top {top_k}")
-        
-        try:
-            # Przygotuj pary query-document
-            pairs = [[query, chunk.content] for chunk in chunks]
-            
-            # Batch processing dla wydajności
-            batch_size = 16
-            all_scores = []
-            
-            with torch.no_grad():
-                for i in range(0, len(pairs), batch_size):
-                    batch_pairs = pairs[i:i + batch_size]
-                    
-                    # Tokenizacja
-                    inputs = self.tokenizer(
-                        batch_pairs,
-                        padding=True,
-                        truncation=True,
-                        max_length=512,
-                        return_tensors='pt'
-                    ).to(self.device)
-                    
-                    # Predykcja
-                    outputs = self.model(**inputs)
-                    scores = outputs.logits.squeeze(-1).cpu().numpy()
-                    
-                    # Jeśli pojedynczy wynik, przekonwertuj na listę
-                    if scores.ndim == 0:
-                        scores = [float(scores)]
-                    else:
-                        scores = scores.tolist()
-                    
-                    all_scores.extend(scores)
-            
-            # Przypisz rerank scores
-            for i, chunk in enumerate(chunks):
-                chunk.rerank_score = float(all_scores[i])
-            
-            # Sortuj według rerank score (wyższy = lepszy)
-            reranked_chunks = sorted(chunks, key=lambda x: x.rerank_score, reverse=True)
-            
-            # Logowanie top scores
-            logger.info("📊 Top 3 rerank scores:")
-            for i, chunk in enumerate(reranked_chunks[:3]):
-                preview = chunk.content[:100].replace('\n', ' ')
-                logger.info(f"  {i+1}. Score: {chunk.rerank_score:.4f} | Preview: {preview}...")
-            
-            return reranked_chunks[:top_k]
-            
-        except Exception as e:
-            logger.error(f"Błąd podczas rerankingu: {e}")
-            # Fallback - zwróć oryginalne chunki
-            return chunks[:top_k]
-
-
 class OllamaClient:
-    """Klient do komunikacji z Ollama"""
-    
+    """Klient Ollama"""
+
     def __init__(self, host: str, model_name: str):
         self.host = host
         self.model_name = model_name
-        
+
     def generate_response(self, context: str, question: str) -> str:
-        """Generuje odpowiedź na podstawie kontekstu"""
-        
-        prompt = self._create_legal_prompt(context, question)
-        
-        try:
-            response = requests.post(
-                f"{self.host}/api/generate",
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "top_p": 0.9,
-                        "max_tokens": 1000
-                    }
-                },
-                timeout=1000
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                return result.get('response', 'Brak odpowiedzi z modelu')
-            else:
-                logger.error(f"Błąd HTTP {response.status_code}: {response.text}")
-                return "Nie udało się uzyskać odpowiedzi z modelu"
-                
-        except requests.exceptions.Timeout:
-            logger.error("Timeout podczas komunikacji z Ollama")
-            return "Przekroczono czas oczekiwania na odpowiedź"
-        except Exception as e:
-            logger.error(f"Błąd podczas generowania odpowiedzi: {e}")
-            return f"Wystąpił błąd: {str(e)}"
-    
-    def _create_legal_prompt(self, context: str, question: str) -> str:
-        """Prompt dla asystenta prawnego"""
-        
+        """Generuje odpowiedź"""
         prompt = f"""Jesteś asystentem prawnym specjalizującym się w polskim prawie. Na podstawie podanych fragmentów dokumentów odpowiedz na pytanie użytkownika.
 
-NAJLEPSZE FRAGMENTY DOKUMENTÓW (wybrane przez system retrieval + reranking):
+
+
+FRAGMENTY:
 {context}
 
-PYTANIE UŻYTKOWNIKA:
-{question}
+
+
+PYTANIE: {question}
+
+
 
 INSTRUKCJE:
 1. Odpowiadaj wyłącznie na podstawie podanych fragmentów
@@ -255,248 +237,330 @@ INSTRUKCJE:
 5. Jeśli nie ma wystarczających informacji w podanych fragmentach, napisz to jasno
 6. Nie dodawaj informacji spoza podanych fragmentów
 
+
+
 ODPOWIEDŹ:"""
-        
-        return prompt
+
+        try:
+            response = requests.post(
+                f"{self.host}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.3}
+                },
+                timeout=1200
+            )
+
+            if response.status_code == 200:
+                return response.json().get('response', 'Brak odpowiedzi')
+
+            return "Błąd generowania"
+        except Exception as e:
+            return f"Błąd: {str(e)}"
 
 
 class LegalRAGSystem:
-    """Główna klasa systemu RAG z dwuetapowym przetwarzaniem"""
-    
+    """System RAG"""
+
     def __init__(self, config: LegalRAGConfig):
         self.config = config
-        
-        # Inicjalizacja komponentów
+
+        embedding_client = EmbeddingClient(
+            config.embedding_service_url,
+            timeout=config.embedding_timeout,
+            retries=config.embedding_retries
+        )
+
         self.es_client = ElasticsearchRetrievalClient(
-            config.elasticsearch_host, 
+            config.elasticsearch_host,
             config.elasticsearch_index,
-            config.embedding_service_url
+            embedding_client
         )
-        
-        if config.use_reranking:
-            self.reranker = PolishReranker()
-        else:
-            self.reranker = None
-            
-        self.ollama_client = OllamaClient(
-            config.ollama_host, 
-            config.model_name
-        )
-    
+
+        self.reranking_client = RerankingClient(
+            config.reranking_service_url
+        ) if config.use_reranking else None
+
+        self.ollama_client = OllamaClient(config.ollama_host, config.model_name)
+
     def process_question(self, question: str) -> dict:
-        """
-        Dwuetapowy pipeline:
-        1. Retrieval: sdadas/mmlw-retrieval-roberta-large → top-50
-        2. Reranking: sdadas/polish-reranker-roberta-v3 → top-6
-        3. Generowanie odpowiedzi przez PLLuM
-        """
-        
-        logger.info(f"🔍 Przetwarzanie pytania: {question}")
-        
-        # ETAP 1: RETRIEVAL - pobierz top-K kandydatów
-        logger.info(f"📊 ETAP 1: Retrieval (top-{self.config.retrieval_top_k})...")
-        retrieved_chunks = self.es_client.search_with_embeddings(
-            question, 
-            self.config.retrieval_top_k
-        )
-        
-        if not retrieved_chunks:
+        """Pipeline przetwarzania z progress tracking"""
+
+        # RETRIEVAL
+        with st.spinner("🔍 Wyszukiwanie fragmentów..."):
+            retrieved = self.es_client.search_with_embeddings(
+                question,
+                self.config.retrieval_top_k
+            )
+
+        if not retrieved:
             return {
-                'answer': 'Nie znaleziono odpowiednich dokumentów dla Twojego pytania.',
+                'answer': 'Brak dokumentów',
                 'chunks': [],
                 'confidence': 0.0,
-                'pipeline_stats': {
-                    'retrieved': 0,
-                    'reranked': 0,
-                    'final': 0,
-                    'reranking_used': False
-                }
+                'pipeline_stats': {'retrieved': 0, 'final': 0, 'reranking_used': False}
             }
-        
-        # ETAP 2: RERANKING - wybierz najlepsze fragmenty
-        if self.config.use_reranking and self.reranker:
-            logger.info(f"🎯 ETAP 2: Reranking (top-{self.config.rerank_top_k})...")
-            final_chunks = self.reranker.rerank_chunks(
-                question, 
-                retrieved_chunks,
-                self.config.rerank_top_k
-            )
-            reranking_used = True
-        else:
-            final_chunks = retrieved_chunks[:self.config.rerank_top_k]
-            reranking_used = False
-        
-        # ETAP 3: Przygotowanie kontekstu
-        context = self._prepare_context(final_chunks)
-        
-        # ETAP 4: Generowanie odpowiedzi
-        logger.info("🧠 ETAP 3: Generowanie odpowiedzi przez LLM...")
-        answer = self.ollama_client.generate_response(context, question)
-        
-        # Przygotowanie wyników
-        confidence = self._calculate_confidence(final_chunks)
-        
-        pipeline_stats = {
-            'retrieved': len(retrieved_chunks),
-            'reranked': len(retrieved_chunks) if reranking_used else 0,
-            'final': len(final_chunks),
-            'reranking_used': reranking_used
-        }
-        
+
+        st.success(f"✅ Znaleziono {len(retrieved)} fragmentów")
+
+        # RERANKING
+        final = retrieved
+        reranking_used = False
+
+        if self.config.use_reranking and self.reranking_client:
+            with st.spinner("🎯 Reranking dokumentów..."):
+                documents = [chunk.content for chunk in retrieved]
+                scores, indices = self.reranking_client.rerank(
+                    question,
+                    documents,
+                    self.config.rerank_top_k
+                )
+
+                if indices:
+                    final = [retrieved[i] for i in indices]
+                    for i, idx in enumerate(indices):
+                        final[i].rerank_score = float(scores[i])
+                    reranking_used = True
+                    st.success(f"✅ Reranking: wybrano {len(final)} najlepszych")
+
+        if not reranking_used and len(final) > self.config.rerank_top_k:
+            final = final[:self.config.rerank_top_k]
+
+        # GENEROWANIE
+        context = self._prepare_context(final)
+        with st.spinner("🧠 Generowanie odpowiedzi..."):
+            answer = self.ollama_client.generate_response(context, question)
+
         return {
             'answer': answer,
-            'chunks': final_chunks,
-            'confidence': confidence,
-            'pipeline_stats': pipeline_stats
+            'chunks': final,
+            'confidence': self._calculate_confidence(final),
+            'pipeline_stats': {
+                'retrieved': len(retrieved),
+                'final': len(final),
+                'reranking_used': reranking_used
+            }
         }
-    
+
     def _prepare_context(self, chunks: List[DocumentChunk]) -> str:
-        """Przygotowuje kontekst z najlepszych chunków"""
-        
-        context_parts = []
-        current_length = 0
-        
+        parts = []
+        length = 0
+
         for i, chunk in enumerate(chunks, 1):
-            score_info = ""
-            if chunk.rerank_score is not None:
-                score_info = f" (rerank: {chunk.rerank_score:.3f})"
-            else:
-                score_info = f" (retrieval: {chunk.retrieval_score:.3f})"
-            
-            fragment = f"""
-FRAGMENT {i}{score_info}:
-{chunk.content}
----"""
-            
-            if current_length + len(fragment) > self.config.max_context_length:
-                logger.info(f"Osiągnięto limit kontekstu, używam {i-1} fragmentów")
+            score = chunk.rerank_score if chunk.rerank_score else chunk.retrieval_score
+            frag = f"[{i}] {chunk.source} (score: {score:.3f})\n{chunk.content}\n"
+
+            if length + len(frag) > self.config.max_context_length:
                 break
-                
-            context_parts.append(fragment)
-            current_length += len(fragment)
-        
-        return "\n".join(context_parts)
-    
+
+            parts.append(frag)
+            length += len(frag)
+
+        return "\n".join(parts)
+
     def _calculate_confidence(self, chunks: List[DocumentChunk]) -> float:
-        """Oblicza pewność na podstawie scores"""
-        
         if not chunks:
             return 0.0
-        
-        # Użyj rerank scores jeśli dostępne
-        rerank_scores = [c.rerank_score for c in chunks if c.rerank_score is not None]
-        if rerank_scores:
-            # Normalizacja sigmoid-like
-            max_score = max(rerank_scores)
-            min_score = min(rerank_scores)
-            
-            if max_score > min_score:
-                normalized = [(score - min_score) / (max_score - min_score) for score in rerank_scores]
-                return sum(normalized) / len(normalized)
-            else:
-                return 0.5
-        
-        # Fallback do retrieval scores
-        retrieval_scores = [c.retrieval_score for c in chunks]
-        if retrieval_scores:
-            max_score = max(retrieval_scores)
-            if max_score > 0:
-                normalized = [score / max_score for score in retrieval_scores]
-                return sum(normalized) / len(normalized)
-        
-        return 0.0
+        scores = [c.rerank_score or c.retrieval_score for c in chunks]
+        return sum(scores) / (len(scores) * max(scores)) if scores else 0.0
+
+
+def search_phrase_in_index(es_client, index_name, phrase):
+    query = {
+        "query": {
+            "match_phrase": {
+                "content": phrase
+            }
+        }
+    }
+
+    try:
+        res = es_client.search(index=index_name, body=query)
+    except Exception as e:
+        st.error(f"Błąd zapytania do Elasticsearch: {e}")
+        return []
+
+    results = []
+    for hit in res['hits']['hits']:
+        content = hit['_source']['content'].lower()
+        count = content.count(phrase.lower())
+        if count > 0:
+            filename = hit['_source']['filename']
+            if filename.endswith(".txt"):
+                filename = filename[:-4]
+            results.append({
+                "document": filename,
+                "count": count
+            })
+
+    results.sort(key=lambda x: x['count'], reverse=True)
+    return results
+
+
+def init_session_state():
+    """Inicjalizuje session state"""
+    if 'rag_system' not in st.session_state:
+        st.session_state.rag_system = None
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
 
 
 def main():
-    """Główna funkcja aplikacji"""
-    
-    print("🏛️  System RAG z Polskim Rerankingiem")
-    print("=" * 70)
-    print("📊 Pipeline dwuetapowy:")
-    print("   1️⃣  RETRIEVAL: sdadas/mmlw-retrieval-roberta-large → top-50")
-    print("   2️⃣  RERANKING: sdadas/polish-reranker-roberta-v3 → top-6")
-    print("   3️⃣  GENERATION: PLLuM (Ollama)")
-    print("=" * 70)
-    print("Wpisz 'exit' aby zakończyć\n")
-    
-    # Konfiguracja systemu
-    config = LegalRAGConfig()
-    
-    # Możliwość override z zmiennych środowiskowych
-    config.elasticsearch_host = os.getenv('ELASTICSEARCH_HOST', config.elasticsearch_host)
-    config.elasticsearch_index = os.getenv('ELASTICSEARCH_INDEX', config.elasticsearch_index)
-    config.embedding_service_url = os.getenv('EMBEDDING_SERVICE_URL', config.embedding_service_url)
-    config.ollama_host = os.getenv('OLLAMA_HOST', config.ollama_host)
-    config.use_reranking = os.getenv('USE_RERANKING', 'true').lower() == 'true'
-    config.retrieval_top_k = int(os.getenv('RETRIEVAL_TOP_K', '50'))
-    config.rerank_top_k = int(os.getenv('RERANK_TOP_K', '6'))
-    
-    try:
-        # Inicjalizacja systemu
-        logger.info("Inicjalizacja systemu RAG...")
-        rag_system = LegalRAGSystem(config)
-        
-        print("\n✅ System zainicjalizowany!")
-        print(f"📊 Konfiguracja:")
-        print(f"   • Retrieval top-K: {config.retrieval_top_k}")
-        print(f"   • Reranking top-K: {config.rerank_top_k}")
-        print(f"   • Reranking: {'✅ WŁĄCZONY' if config.use_reranking else '❌ WYŁĄCZONY'}")
-        print(f"   • Max długość kontekstu: {config.max_context_length}")
-        print()
-        
-        while True:
-            question = input("💬 Twoje pytanie: ").strip()
-            
-            if question.lower() in ['exit', 'quit', 'koniec']:
-                print("👋 Do widzenia!")
-                break
-                
-            if not question:
-                continue
-            
-            print("\n" + "="*70)
-            print("🔄 PIPELINE W AKCJI:")
-            print("="*70)
-            
-            # Przetwarzanie pytania
-            result = rag_system.process_question(question)
-            
-            # Wyświetlenie odpowiedzi
-            print(f"\n📖 ODPOWIEDŹ:")
-            print("-" * 70)
-            print(result['answer'])
-            
-            # Statystyki pipeline'u
-            stats = result['pipeline_stats']
-            print(f"\n📊 STATYSTYKI PIPELINE'U:")
-            print(f"   1️⃣  Retrieval: {stats['retrieved']} chunków")
-            if stats['reranking_used']:
-                print(f"   2️⃣  Reranking: {stats['reranked']} → {stats['final']} chunków")
-            else:
-                print(f"   2️⃣  Reranking: POMINIĘTY")
-            print(f"   3️⃣  Finalne chunki w kontekście: {stats['final']}")
-            print(f"   📈 Poziom pewności: {result['confidence']:.2%}")
-            
-            # Wyświetlenie najlepszych chunków
-            if result['chunks']:
-                print(f"\n📚 NAJLEPSZE FRAGMENTY:")
-                for i, chunk in enumerate(result['chunks'], 1):
-                    print(f"\n{i}. {'🥇' if i == 1 else '🥈' if i == 2 else '🥉' if i == 3 else '📄'}")
-                    if chunk.rerank_score is not None:
-                        print(f"   🎯 Rerank Score: {chunk.rerank_score:.4f}")
-                    print(f"   📊 Retrieval Score: {chunk.retrieval_score:.3f}")
-                    preview = chunk.content.replace('\n', ' ')
-                    idxx = chunk.chunk_id
-                    print(f"   📝 Fragment: {preview}...{idxx}")
-            
-            print("\n" + "="*70 + "\n")
-    
-    except KeyboardInterrupt:
-        print("\n👋 Do widzenia!")
-    except Exception as e:
-        logger.error(f"Błąd krytyczny: {e}", exc_info=True)
-        print(f"❌ Wystąpił błąd: {e}")
+    """Główna funkcja"""
 
+    st.set_page_config(
+        page_title="HDC Sandbox MWI",
+        page_icon="⚖️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    init_session_state()
+
+    # Header
+    st.title("⚖️ HDC Sandbox - MWI")
+    st.markdown("---")
+
+    # Sidebar
+    with st.sidebar:
+        st.header("🛠️ Konfiguracja")
+
+        available_models = [
+            "SpeakLeash/bielik-4.5b-v3.0-instruct:Q8_0",  # default
+            "SpeakLeash/bielik-1.5b-v3.0-instruct:Q8_0",
+            "PRIHLOP/PLLuM:12b"
+        ]
+
+        model_name = st.selectbox(
+            "Model LLM",
+            options=available_models,
+            index=0,
+            help="Wybierz model LLM do generowania odpowiedzi"
+        )
+        use_reranking = True
+
+        retrieval_top_k = st.slider("Retrieval top-K", 10, 100, 50)
+        rerank_top_k = st.slider("Reranking top-K", 3, 20, 3)
+
+        st.markdown("---")
+
+        # Inicjalizacja
+        if st.button("🔄 Inicjalizuj System", type="primary"):
+            config = LegalRAGConfig(
+                elasticsearch_host=os.getenv("ELASTICSEARCH_HOST"),
+                elasticsearch_index=os.getenv("ES_INDEX"),
+                embedding_service_url=os.getenv("EMBED_URL"),
+                reranking_service_url=os.getenv("RERANK_URL"),
+                ollama_host=os.getenv("OLLAMA_HOST"),
+                model_name=model_name,
+                retrieval_top_k=retrieval_top_k,
+                rerank_top_k=rerank_top_k,
+                use_reranking=use_reranking
+            )
+
+            try:
+                with st.spinner("Inicjalizacja..."):
+                    st.session_state.rag_system = LegalRAGSystem(config)
+                st.success("✅ System zainicjalizowany!")
+            except Exception as e:
+                st.error(f"❌ Błąd: {e}")
+
+        # Status
+        if st.session_state.rag_system:
+            st.success("🟢 System gotowy")
+        else:
+            st.warning("🟡 System niezainicjalizowany")
+
+        # Reset
+        if st.button("🗑️ Wyczyść Historię"):
+            st.session_state.chat_history = []
+            st.rerun()
+
+    # Główny interfejs
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        es = Elasticsearch(os.getenv("ELASTICSEARCH_HOST"))
+        with st.expander("🔍 Wyszukiwarka fraz", expanded=False):
+            phrase = st.text_input("Wpisz frazę do wyszukania")
+
+            if phrase:
+                results = search_phrase_in_index(es, 'ustawy', phrase)
+
+                if results:
+                    st.write(f"Liczba dokumentów zawierających frazę '{phrase}': {len(results)}")
+                    for r in results:
+                        st.write(f"- **{r['document']}** — liczba wystąpień: {r['count']}")
+                else:
+                    st.write(f"Brak dokumentów zawierających frazę '{phrase}'.")
+
+        st.subheader("💬 Zadaj Pytanie")
+
+        with st.form("question_form"):
+            question = st.text_area(
+                "Twoje pytanie:",
+                height=100,
+                placeholder="Np: Jaka jest definicja produktu leczniczego?"
+            )
+
+            submitted = st.form_submit_button("🔍 Zadaj Pytanie", type="primary")
+
+            if submitted and question and st.session_state.rag_system:
+                start_time = time.time()
+
+                # Przetwarzanie
+                result = st.session_state.rag_system.process_question(question)
+
+                end_time = time.time()
+                response_time = end_time - start_time
+
+                # Historia
+                st.session_state.chat_history.append({
+                    'question': question,
+                    'result': result,
+                    'response_time': response_time,
+                    'timestamp': time.strftime('%H:%M:%S')
+                })
+
+                st.rerun()
+
+        # Historia
+        if st.session_state.chat_history:
+            st.subheader("📜 Historia Rozmów")
+
+            for chat in reversed(st.session_state.chat_history):
+                with st.expander(f"💬 {chat['timestamp']} - {chat['question'][:50]}..."):
+                    st.markdown(f"**Pytanie:** {chat['question']}")
+
+                    st.markdown("**Odpowiedź:**")
+                    st.write(chat['result']['answer'])
+
+                    # Metryki
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    with col_m1:
+                        st.metric("⏱️ Czas", f"{chat['response_time']:.2f}s")
+                    with col_m2:
+                        st.metric("📈 Pewność", f"{chat['result']['confidence']:.0%}")
+                    with col_m3:
+                        stats = chat['result']['pipeline_stats']
+                        st.metric("🎯 Reranking", "✅" if stats['reranking_used'] else "❌")
+
+
+                    if chat['result']['chunks']:
+                        st.markdown("**📚 Źródła:**")
+                        for i, chunk in enumerate(chat['result']['chunks'], 1):
+                            score = chunk.rerank_score if chunk.rerank_score else chunk.retrieval_score
+                            score_type = "🎯 Rerank" if chunk.rerank_score else "📊 Retrieval" 
+
+                            with st.container():
+                                st.markdown(f"**{i}. {chunk.source}** ({score_type}: {score:.3f})")
+                                preview = chunk.content
+                                st.text(preview)
+                                st.markdown("---")
 
 if __name__ == "__main__":
     main()
+
+                
