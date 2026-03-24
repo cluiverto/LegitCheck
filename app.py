@@ -411,7 +411,7 @@ def main():
     """Główna funkcja"""
 
     st.set_page_config(
-        page_title="HDC Sandbox MWI",
+        page_title="LegitCheck",
         page_icon="⚖️",
         layout="wide",
         initial_sidebar_state="expanded"
@@ -420,7 +420,7 @@ def main():
     init_session_state()
 
     # Header
-    st.title("⚖️ HDC Sandbox - MWI")
+    st.title("⚖️ LegitCheck")
     st.markdown("---")
 
     # Sidebar
