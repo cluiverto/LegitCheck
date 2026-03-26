@@ -1,0 +1,27 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip setuptools wheel
+
+COPY requirements_embedding.txt .
+
+RUN pip install --no-cache-dir \
+    --no-build-isolation \
+    -r requirements_embedding.txt
+
+COPY embedding_service.py .
+
+RUN mkdir -p /tmp/huggingface_cache /tmp/transformers_cache /tmp/model_cache
+
+EXPOSE 8000
+
+# Run
+CMD ["python", "embedding_service.py"]

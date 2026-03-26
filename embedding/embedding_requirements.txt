@@ -1,0 +1,27 @@
+# Sentence transformers z kompatybilnymi zależnościami
+sentence-transformers==2.2.2
+
+
+# PyTorch - wybierz odpowiednią wersję dla twojego systemu
+torch==2.0.1
+torchvision==0.15.2
+torchaudio==2.0.2
+
+
+# Hugging Face - WAŻNE: te wersje muszą być kompatybilne
+transformers==4.33.3
+huggingface-hub==0.17.3
+tokenizers==0.13.3
+
+
+# Pozostałe zależności
+numpy==1.24.3
+scipy==1.11.3
+scikit-learn==1.3
+requests==2.31.0
+pydantic==2.5.0
+
+
+# Dla cache'a i optymalizacji
+safetensors==0.4.0
+pillow==10.0.1
