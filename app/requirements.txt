@@ -1,0 +1,6 @@
+streamlit==1.47.0
+elasticsearch>=7.16,<8
+requests
+numpy
+python-dotenv
+dataclasses
