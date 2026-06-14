@@ -3,3 +3,4 @@
 notebooks/splitter.py
 notebooks/__pycache__/
 chunks.json
+app/.env
