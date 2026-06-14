@@ -1,0 +1,54 @@
+version: "3.8"
+
+services:
+
+  embedding-service:
+    build:
+      context: ./embedding
+      dockerfile: Dockerfile.embedding
+    image: embedding-service
+    container_name: embedding-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./model_cache:/tmp/huggingface_cache
+    networks:
+      - mwi-network
+
+  reranking-service:
+    build:
+      context: ./reranking
+      dockerfile: Dockerfile.reranking
+    image: reranking-service
+    container_name: reranking-service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./model_cache:/tmp/huggingface_cache
+    networks:
+      - mwi-network
+
+  python-app:
+    build:
+      context: ./app
+    container_name: mwi_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      ELASTICSEARCH_HOST: "http://host.docker.internal:9200"
+      ELASTICSEARCH_INDEX: "ustawy"
+      EMBED_URL: "http://embedding-service:8000"
+      RERANK_URL: "http://reranking-service:8001"
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+    depends_on:
+      - embedding-service
+      - reranking-service
+    networks:
+      - mwi-network
+
+networks:
+  mwi-network:
+    driver: bridge
